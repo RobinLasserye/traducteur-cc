@@ -78,4 +78,4 @@ Journaux : `~/.local/state/ctrlcc/daemon.log` et `popup.log`.
 
 ## Licence
 
-MIT — voir [LICENSE](LICENSE).
+GPL-3.0 — voir [LICENSE](LICENSE). © 2026 Robin Lasserye.
