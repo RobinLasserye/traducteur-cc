@@ -12,6 +12,8 @@ import fcntl
 import logging
 import os
 import selectors
+import queue
+import threading
 import subprocess
 import sys
 import time
@@ -119,14 +121,45 @@ def trigger(popup_holder):
     if prev and prev.poll() is None:
         prev.terminate()
     log.info('déclenché — %d caractères', len(text))
-    proc = subprocess.Popen([sys.executable, POPUP], stdin=subprocess.PIPE,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(os.path.join(STATE_DIR, 'popup-stderr.log'), 'ab') as stderr:
+        proc = subprocess.Popen([sys.executable, POPUP], stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=stderr)
     try:
         proc.stdin.write(text.encode())
         proc.stdin.close()
     except BrokenPipeError:
         log.warning('popup mort avant réception du texte')
     popup_holder['proc'] = proc
+    if prev:
+        # Récolte le processus remplacé : pas de zombies après des demandes rapides.
+        try:
+            prev.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            prev.kill()
+            prev.wait()
+
+
+class TriggerWorker:
+    """Lecture du presse-papier hors boucle evdev, une seule demande en attente."""
+
+    def __init__(self):
+        self.pending = queue.Queue(maxsize=1)
+        self.popup_holder = {}
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def submit(self):
+        try:
+            self.pending.put_nowait(True)
+        except queue.Full:
+            pass  # La demande déjà en attente lira la dernière sélection.
+
+    def run(self):
+        while True:
+            self.pending.get()
+            try:
+                trigger(self.popup_holder)
+            except Exception:
+                log.exception('échec déclenchement — écoute clavier maintenue')
 
 
 def main():
@@ -147,7 +180,7 @@ def main():
     sel = selectors.DefaultSelector()
     watched = {}
     detector = DoubleCtrlC()
-    popup_holder = {}
+    trigger_worker = TriggerWorker()
     scan_keyboards(sel, watched)
     log.info('démarré — %d clavier(s)', len(watched))
     last_scan = time.monotonic()
@@ -160,7 +193,7 @@ def main():
                     if ev.type != e.EV_KEY:
                         continue
                     if detector.feed(ev.code, ev.value, time.monotonic()):
-                        trigger(popup_holder)
+                        trigger_worker.submit()
             except OSError:
                 drop_device(sel, watched, dev.path)
         if time.monotonic() - last_scan >= RESCAN_EVERY:

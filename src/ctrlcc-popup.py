@@ -13,10 +13,11 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
-from PyQt6.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
@@ -59,17 +60,54 @@ def ollama_models():
         return []
 
 
-def ollama_chat(model, system, user, timeout=180):
+def ollama_chat(model, system, user, timeout=180, on_chunk=None, cancelled=None):
     payload = json.dumps({
-        'model': model, 'stream': False, 'think': False,
+        'model': model, 'stream': on_chunk is not None, 'think': False,
         'options': {'temperature': 0.2},
         'messages': [{'role': 'system', 'content': system},
                      {'role': 'user', 'content': user}],
     }).encode()
     req = urllib.request.Request(f'{OLLAMA}/api/chat', data=payload,
                                  headers={'Content-Type': 'application/json'})
+    started = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)['message']['content'].strip()
+        if on_chunk is None:
+            packet = json.load(r)
+            if packet.get('error'):
+                raise RuntimeError(packet['error'])
+            result = packet['message']['content'].strip()
+        else:
+            parts, complete = [], False
+            first = True
+            for line in r:
+                if cancelled and cancelled.is_set():
+                    raise InterruptedError('Traduction annulée')
+                if time.monotonic() - started > timeout:
+                    raise TimeoutError('Délai de traduction dépassé')
+                if not line.strip():
+                    continue
+                packet = json.loads(line)
+                if packet.get('error'):
+                    raise RuntimeError(packet['error'])
+                piece = packet.get('message', {}).get('content', '')
+                if piece:
+                    parts.append(piece)
+                    on_chunk(''.join(parts))
+                    if first:
+                        log.info('premier texte en %.2f s', time.monotonic() - started)
+                        first = False
+                if packet.get('done'):
+                    complete = True
+                    break
+            if not complete:
+                raise RuntimeError('Flux Ollama interrompu avant la fin')
+            result = ''.join(parts).strip()
+        if not result:
+            raise RuntimeError('Réponse vide du modèle')
+        log.info('appel Ollama %.2f s (chargement %.2f s, génération %.2f s)',
+                 time.monotonic() - started, packet.get('load_duration', 0) / 1e9,
+                 packet.get('eval_duration', 0) / 1e9)
+        return result
 
 
 # Le prompt conditionnel (« si français → anglais, sinon → français ») fait
@@ -84,7 +122,8 @@ LANG_ALIASES = {
 
 
 def normalize_lang(name):
-    word = name.strip().lower().strip('.,!«»" \n').split()[0] if name.strip() else ''
+    words = name.strip().lower().strip('.,!«»" \n').split()
+    word = words[0] if words else ''
     return LANG_ALIASES.get(word, word)
 
 
@@ -105,36 +144,51 @@ def pick_target(detected, cfg):
     return cfg['lang_a']
 
 
-def translate(text, cfg):
+def translate(text, cfg, on_chunk=None, cancelled=None):
     """Retourne (langue détectée, langue cible, traduction)."""
     detected = detect_language(cfg['model'], text)
+    if cancelled and cancelled.is_set():
+        raise InterruptedError('Traduction annulée')
     target = pick_target(detected, cfg)
     system = (
         f'Tu es un traducteur professionnel. Traduis le texte de '
         f'l\'utilisateur en {target}. Préserve la mise en forme et les '
         'retours à la ligne. Réponds UNIQUEMENT avec la traduction, sans '
         'explication ni commentaire.')
-    return detected, target, ollama_chat(cfg['model'], system, text)
+    return detected, target, ollama_chat(cfg['model'], system, text,
+                                         on_chunk=on_chunk, cancelled=cancelled)
 
 
 class Translator(QObject):
     done = pyqtSignal(str, str)   # traduction, "détectée → cible"
     failed = pyqtSignal(str)
+    progress = pyqtSignal(str)
+    finished = pyqtSignal()
 
     def __init__(self, text, cfg):
         super().__init__()
-        self.text, self.cfg = text, cfg
+        self.text, self.cfg = text, dict(cfg)
+        self.cancelled = threading.Event()
 
     def run(self):
         try:
-            detected, target, out = translate(self.text, self.cfg)
+            detected, target, out = translate(
+                self.text, self.cfg, self.progress.emit, self.cancelled)
+            if self.cancelled.is_set():
+                return
             log.info('traduction OK %s → %s (%d → %d caractères)',
                      detected, target, len(self.text), len(out))
             self.done.emit(out, f'{detected} → {normalize_lang(target)}')
+        except InterruptedError:
+            pass
         except Exception as exc:
+            if self.cancelled.is_set():
+                return
             log.error('échec traduction : %s', exc)
             self.failed.emit(f'Échec de la traduction : {exc}\n'
                              'Ollama est-il démarré ? (systemctl status ollama)')
+        finally:
+            self.finished.emit()
 
 
 class PasteInjector(QObject):
@@ -209,13 +263,15 @@ class Popup(QWidget):
         self.translation = None
         self.cfg = load_config()
         self.injector = PasteInjector()
+        self._workers = set()
+        self._closing = False
+        self.autoclose = QTimer(self)
+        self.autoclose.setSingleShot(True)
+        self.autoclose.timeout.connect(self.close)
         self.build_ui()
         self.start_translation()
-        QTimer.singleShot(AUTOCLOSE_MS, QApplication.quit)
         # Prépare le clavier virtuel pendant que la traduction tourne
-        self.inj_thread = QThread()
-        self.injector.moveToThread(self.inj_thread)
-        self.inj_thread.started.connect(self.injector.prepare)
+        self.inj_thread = threading.Thread(target=self.injector.prepare, daemon=True)
         self.inj_thread.start()
 
     def build_ui(self):
@@ -262,7 +318,7 @@ class Popup(QWidget):
         self.replace_btn.clicked.connect(self.do_replace)
         close = QPushButton('✕')
         close.setFixedWidth(38)
-        close.clicked.connect(QApplication.quit)
+        close.clicked.connect(self.close)
         for b in (gear, self.copy_btn, self.replace_btn, close):
             btns.addWidget(b)
         for w in (self.copy_btn, self.replace_btn):
@@ -278,15 +334,27 @@ class Popup(QWidget):
                   geo.y() + int(geo.height() * 0.12))
 
     def start_translation(self):
-        self.worker = Translator(self.source, self.cfg)
-        self.thread = QThread()
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.done.connect(self.show_result)
-        self.worker.failed.connect(self.show_error)
-        self.thread.start()
+        self.autoclose.stop()
+        if hasattr(self, 'worker'):
+            self.worker.cancelled.set()
+        worker = Translator(self.source, self.cfg)
+        self.worker = worker
+        self._workers.add(worker)
+        # Les workers restent vivants jusqu'à la fin. Les résultats d'une
+        # ancienne requête ne peuvent jamais écraser les nouveaux paramètres.
+        worker.done.connect(lambda text, direction: self.show_result(text, direction)
+                            if self.worker is worker and not self._closing else None)
+        worker.progress.connect(lambda text: self.result.setPlainText(text)
+                                if self.worker is worker and not self._closing else None)
+        worker.failed.connect(lambda error: self.show_error(error)
+                              if self.worker is worker and not self._closing else None)
+        worker.finished.connect(lambda: self._workers.discard(worker))
+        # Un thread Python daemon permet de fermer immédiatement l'application
+        # même si un appel réseau est encore bloqué, sans destruction QThread.
+        threading.Thread(target=worker.run, daemon=True).start()
 
     def show_result(self, text, direction):
+        self.autoclose.start(AUTOCLOSE_MS)
         self.translation = text
         self.result.setPlainText(text)
         self.title.setText(f'🌐 Traducteur Ctrl+C+C — {direction}')
@@ -294,6 +362,7 @@ class Popup(QWidget):
         self.replace_btn.setEnabled(True)
 
     def show_error(self, message):
+        self.autoclose.start(AUTOCLOSE_MS)
         self.result.setPlainText('⚠ ' + message)
 
     def do_copy(self):
@@ -327,8 +396,12 @@ class Popup(QWidget):
             self.start_translation()
 
     def closeEvent(self, event):
+        self._closing = True
+        for worker in self._workers:
+            worker.cancelled.set()
         self.injector.close()
         event.accept()
+        QApplication.quit()
 
 
 def main():

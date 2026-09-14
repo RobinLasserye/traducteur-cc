@@ -19,7 +19,7 @@ service en ligne.
   - **Copier** — met la traduction dans le presse-papier, pour le texte
     affiché non modifiable ;
   - **⚙** — paramètres : les deux langues et le modèle Ollama ;
-  - **✕** — fermer (auto-fermeture après 2 min).
+  - **✕** — fermer (auto-fermeture 2 min après le résultat).
 
 ## Prérequis
 
@@ -59,10 +59,38 @@ par défaut `~/.config/ctrlcc/config.json`, active le démarrage automatique
 | Composant | Rôle |
 |---|---|
 | `src/ctrlcc_daemon.py` | Écoute les claviers (evdev), détecte le double `Ctrl+C`, lit le presse-papier, lance le popup. Gère le branchement/débranchement de claviers à chaud. |
-| `src/ctrlcc-popup.py` | Carte PyQt6 sans vol de focus. Détection de langue puis traduction (deux appels Ollama), injection `Ctrl+V` par clavier virtuel uinput préparé à l'avance. |
+| `src/ctrlcc-popup.py` | Carte PyQt6 sans vol de focus. Détection de langue puis traduction progressive (deux appels Ollama), injection `Ctrl+V` par clavier virtuel uinput préparé à l'avance. |
 | `tests/test_detection.py` | 8 cas sur le détecteur de double `Ctrl+C` (frappe normale, répétition auto, Ctrl droit, délais…). |
 
-Journaux : `~/.local/state/ctrlcc/daemon.log` et `popup.log`.
+Journaux : `~/.local/state/ctrlcc/daemon.log`, `popup.log` (durées des appels
+et du premier texte) et `popup-stderr.log` (erreurs Qt et lancement).
+
+### Vérification
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 tests/test_detection.py
+PYTHONDONTWRITEBYTECODE=1 python3 tests/test_stability.py
+```
+
+Les tests de stabilité utilisent Qt offscreen, sans clavier ni Ollama.
+Ils vérifient notamment la fermeture pendant une requête, les changements de
+paramètres, les résultats obsolètes et les réponses Ollama interrompues.
+
+### Stabilité et réactivité
+
+- Le presse-papier est lu dans un worker avec une seule demande en attente :
+  un logiciel lent à répondre ne bloque plus l'écoute du clavier.
+- Le texte traduit apparaît progressivement ; Copier et Remplacer restent
+  désactivés jusqu'à la réception d'une réponse complète.
+- Les workers réseau peuvent être abandonnés à la fermeture sans détruire un
+  QThread actif. Une ancienne requête ne peut pas écraser le résultat suivant.
+- La fermeture automatique démarre après le résultat ou l'erreur, afin de ne
+  pas interrompre une traduction longue.
+- Le modèle et le sens de traduction restent configurables comme auparavant.
+
+Si tout devient lent, vérifier `ollama ps` : le modèle doit utiliser le GPU
+lorsqu'il est disponible. Une exécution CPU peut multiplier la latence ; les
+journaux Ollama permettent de distinguer ce cas d'un problème de popup.
 
 ### Choix techniques notables
 
